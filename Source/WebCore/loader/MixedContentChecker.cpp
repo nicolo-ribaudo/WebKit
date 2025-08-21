@@ -30,6 +30,7 @@
 #include "config.h"
 #include "MixedContentChecker.h"
 
+#include "BlobURL.h"
 #include "Document.h"
 #include "LegacySchemeRegistry.h"
 #include "LocalFrame.h"
@@ -39,20 +40,66 @@
 
 namespace WebCore {
 
-static bool isDocumentSecure(const Document& document)
+static bool isNonLocalHostPotentiallyTrustworthyURL(const URL& url)
 {
-    // FIXME: Use document.isDocumentSecure(), instead of comparing against "https" scheme, when all ports stop using loopback in LayoutTests
-    // sandboxed iframes have an opaque origin so we should perform the mixed content check considering the origin
-    // the iframe would have had if it were not sandboxed.
-    return document.securityOrigin().protocol() == "https"_s || (document.securityOrigin().isOpaque() && document.url().protocolIs("https"_s));
+    if (!url.isValid()) return true;
+
+    // Secure Contexts
+    // W3C Candidate Recommendation Draft, 10 November 2023
+    // 3.2. Is url potentially trustworthy?
+
+    // We currently deviate from the mixed content spec, and do not consider localhost
+    // or loopback URLs as secure contexts if they do not use a secure scheme.
+    // https://bugs.webkit.org/show_bug.cgi?id=171934
+    if (SecurityOrigin::isLocalHostOrLoopbackIPAddress(url.host()))
+        return LegacySchemeRegistry::shouldTreatURLSchemeAsSecure(url.protocol());
+
+    // 2. If url’s scheme is "data", return "Potentially Trustworthy".
+    if (url.protocolIsData())
+        return true;
+
+    // 3. Return the result of executing § 3.1 Is origin potentially trustworthy? on url’s origin.
+    // NOTE: The origin of blob: URLs is the origin of the context in which they were created.
+    //       Therefore, blobs created in a trustworthy origin will themselves be potentially
+    //       trustworthy.
+    if (url.protocolIsBlob()) {
+        RefPtr origin = SecurityOrigin::createForBlobURL(url);
+
+        // We currently deviate from the mixed content spec, and do not consider localhost
+        // or loopback URLs as secure contexts if they do not use a secure scheme.
+        // https://bugs.webkit.org/show_bug.cgi?id=171934
+        if (SecurityOrigin::isLocalHostOrLoopbackIPAddress(origin->host()))
+            return LegacySchemeRegistry::shouldTreatURLSchemeAsSecure(origin->protocol());
+
+        return origin->isPotentiallyTrustworthy();
+    }
+    return shouldTreatAsPotentiallyTrustworthy(url);
 }
 
-static bool isDataContextSecure(const LocalFrame& frame)
+static bool hasNonLocalHostPotentiallyTrustworthyOrigin(const Document& document)
+{
+    auto& origin = document.securityOrigin();
+
+    // We currently deviate from the mixed content spec, and do not consider localhost
+    // or loopback URLs as secure contexts if they do not use a secure scheme.
+    // https://bugs.webkit.org/show_bug.cgi?id=171934
+    if (SecurityOrigin::isLocalHostOrLoopbackIPAddress(origin.host()))
+        return LegacySchemeRegistry::shouldTreatURLSchemeAsSecure(origin.protocol());
+
+    // sandboxed iframes have an opaque origin so we should perform the mixed content
+    // check considering the origin the iframe would have had if it were not sandboxed.
+    if (origin.isOpaque())
+        return !document.url().protocolIsData() && isNonLocalHostPotentiallyTrustworthyURL(document.url());
+
+    return origin.isPotentiallyTrustworthy();
+}
+
+static bool dataContextProhibitsMixedSecurityContexts(const LocalFrame& frame)
 {
     RefPtr document = frame.document();
 
     while (document) {
-        if (isDocumentSecure(*document))
+        if (hasNonLocalHostPotentiallyTrustworthyOrigin(*document))
             return true;
 
         RefPtr frame = document->frame();
@@ -74,12 +121,13 @@ static bool isDataContextSecure(const LocalFrame& frame)
     return false;
 }
 
-static bool isMixedContent(const Document& document, const URL& url)
+static bool prohibitsMixedSecurityContexts(const Document& document)
 {
-    if (isDocumentSecure(document) || (document.url().protocolIs("data"_s) && isDataContextSecure(*document.frame())))
-        return !SecurityOrigin::isSecure(url);
+    // https://www.w3.org/TR/mixed-content/#upgrade-algorithm
+    // Editor’s Draft, 23 February 2023
+    // 4.3. Does settings prohibit mixed security contexts?
 
-    return false;
+    return hasNonLocalHostPotentiallyTrustworthyOrigin(document) || (document.url().protocolIsData() && dataContextProhibitsMixedSecurityContexts(*document.frame()));
 }
 
 static void logConsoleWarning(const LocalFrame& frame, bool blocked, const URL& target, bool isUpgradingIPAddressAndLocalhostEnabled)
@@ -115,15 +163,17 @@ bool MixedContentChecker::shouldUpgradeInsecureContent(LocalFrame& frame, IsUpgr
 
     // https://www.w3.org/TR/mixed-content/#upgrade-algorithm
     // Editor’s Draft, 23 February 2023
-    // 4.1. Upgrade a mixed content request to a potentially trustworthy URL, if appropriate
-    if (!isMixedContent(*frame.document(), url))
+    // 4.1. Upgrade request to an a priori authenticated URL as mixed content, if appropriate
+
+    // 4.1.1.3 Does settings prohibit mixed security contexts? returns "Does Not Restrict Mixed Security Contents" when applied to request’s client.
+    if (!prohibitsMixedSecurityContexts(*document))
+        return false;
+
+    // 4.1.1.1, 4.1.1.2, 4.1.1.4, 4.1.1.5
+    if (!canModifyRequest(url, destination, initiator))
         return false;
 
     auto shouldUpgradeIPAddressAndLocalhostForTesting = document->settings().iPAddressAndLocalhostMixedContentUpgradeTestingEnabled();
-
-    // 4.1 The request's URL is not upgraded in the following cases.
-    if (!canModifyRequest(url, destination, initiator))
-        return false;
 
     logConsoleWarning(frame, /* blocked */ false, url, shouldUpgradeIPAddressAndLocalhostForTesting);
     return true;
@@ -131,31 +181,50 @@ bool MixedContentChecker::shouldUpgradeInsecureContent(LocalFrame& frame, IsUpgr
 
 bool MixedContentChecker::canModifyRequest(const URL& url, FetchOptions::Destination destination, Initiator initiator)
 {
-    // 4.1.1 request’s URL is a potentially trustworthy URL.
-    if (url.protocolIs("https"_s))
+    // 4.1.1.1 request’s URL is a potentially trustworthy URL.
+    if (isNonLocalHostPotentiallyTrustworthyURL(url))
         return false;
-    // 4.1.2 request’s URL’s host is an IP address.
-    if (URL::hostIsIPAddress(url.host()) && !shouldTreatAsPotentiallyTrustworthy(url))
+
+    // 4.1.1.2 request’s URL’s host is an IP address.
+    // We diverge from the spec when it comes to the loopback address, which consider as upgradable.
+    if (URL::hostIsIPAddress(url.host()) && !SecurityOrigin::isLocalHostOrLoopbackIPAddress(url.host()))
         return false;
-    // 4.1.4 request’s destination is not "image", "audio", or "video".
+
+    // 4.1.1.4 request’s destination is not "image", "audio", or "video".
     if (!destinationIsImageAudioOrVideo(destination))
         return false;
-    // 4.1.5 request’s destination is "image" and request’s initiator is "imageset".
-    auto schemeIsHandledBySchemeHandler = LegacySchemeRegistry::schemeIsHandledBySchemeHandler(url.protocol());
-    if (!schemeIsHandledBySchemeHandler && destinationIsImageAndInitiatorIsImageset(destination, initiator))
+
+    // 4.1.1.5 request’s destination is "image" and request’s initiator is "imageset".
+    if (destinationIsImageAndInitiatorIsImageset(destination, initiator))
         return false;
+
     return true;
 }
 
 bool MixedContentChecker::shouldBlockRequest(LocalFrame& frame, const URL& url, IsUpgradable isUpgradable)
 {
+    if (isUpgradable == IsUpgradable::Yes)
+        return false;
+
+    // https://www.w3.org/TR/mixed-content/#upgrade-algorithm
+    // Editor’s Draft, 23 February 2023
+    // 4.4. Should fetching request be blocked as mixed content?
+
     RefPtr document = frame.document();
     if (!document)
         return false;
-    if (!isMixedContent(*frame.document(), url))
+
+    // 4.4.1.1 Does settings prohibit mixed security contexts? returns "Does Not Restrict Mixed Security Contexts" when applied to request’s client.
+    if (!prohibitsMixedSecurityContexts(*frame.document()))
         return false;
-    if ((LegacySchemeRegistry::schemeIsHandledBySchemeHandler(url.protocol()) || shouldTreatAsPotentiallyTrustworthy(url)) && isUpgradable == IsUpgradable::Yes)
+
+    // 4.4.1.2  request’s URL is a potentially trustworthy URL.
+    if (isNonLocalHostPotentiallyTrustworthyURL(url))
         return false;
+
+    // 4.4.1.3 The user agent has been instructed to allow mixed content, as described in § 7.2 User Controls).
+    // 4.4.1.4 request’s destination is "document", and request’s target browsing context has no parent browsing context.
+
     logConsoleWarning(frame, /* blocked */ true, url, document->settings().iPAddressAndLocalhostMixedContentUpgradeTestingEnabled());
     return true;
 }
@@ -167,7 +236,7 @@ void MixedContentChecker::checkFormForMixedContent(LocalFrame& frame, const URL&
     if (url.protocolIsJavaScript())
         return;
 
-    if (!isMixedContent(*frame.document(), url))
+    if (!prohibitsMixedSecurityContexts(*frame.document()) || isNonLocalHostPotentiallyTrustworthyURL(url))
         return;
 
     auto message = makeString("The page at "_s, frame.document()->url().stringCenterEllipsizedToLength(), " contains a form which targets an insecure URL "_s, url.stringCenterEllipsizedToLength(), ".\n"_s);
